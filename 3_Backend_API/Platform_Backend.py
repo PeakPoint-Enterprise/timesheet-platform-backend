@@ -49,19 +49,31 @@ with app.app_context():
     setup_database()
 
 
-# --- Helper & Root Route ---
+# --- Helper Functions ---
 def is_super_admin():
     """Checks for the super admin key in the request headers."""
     return request.headers.get('X-Admin-Key') == SUPER_ADMIN_KEY
 
 
+def get_agency_id_from_api_key(cur):
+    """Gets agency ID from the API key in the request header."""
+    api_key = request.headers.get('X-Agency-Api-Key')
+    if not api_key:
+        return None
+    cur.execute("SELECT id FROM agencies WHERE api_key = %s;", (api_key,))
+    agency = cur.fetchone()
+    return agency['id'] if agency else None
+
+
+# --- Root Route ---
 @app.route('/')
 def index():
-    """Welcome route to confirm the server is running."""
     return jsonify({"status": "online", "message": "Timesheet Platform API is running."}), 200
 
 
-# --- Super Admin Routes ---
+#
+# --- ADMIN CONSOLE ROUTES ---
+#
 @app.route('/admin/agencies', methods=['GET'])
 def get_agencies():
     if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
@@ -84,10 +96,10 @@ def create_agency():
     if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
     agency_name = request.get_json().get('agency_name')
     if not agency_name: return jsonify({"success": False, "message": "Agency name is required."}), 400
-    new_api_key = str(uuid.uuid4())
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
+        new_api_key = str(uuid.uuid4())
         cur.execute("INSERT INTO agencies (name, api_key) VALUES (%s, %s) RETURNING *;", (agency_name, new_api_key))
         agency = cur.fetchone()
         cur.execute("INSERT INTO settings (agency_id, total_licenses) VALUES (%s, %s);", (agency['id'], 25))
@@ -107,20 +119,16 @@ def create_agency():
 
 @app.route('/admin/agencies/<int:agency_id>', methods=['DELETE'])
 def delete_agency(agency_id):
-    """Deletes an agency and all its associated data."""
     if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
-
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # The ON DELETE CASCADE in the DB schema handles deleting related records
         cur.execute("DELETE FROM agencies WHERE id = %s;", (agency_id,))
         conn.commit()
-        if cur.rowcount == 0:
-            return jsonify({"success": False, "message": "Agency not found."}), 404
+        if cur.rowcount == 0: return jsonify({"success": False, "message": "Agency not found."}), 404
         return jsonify({"success": True, "message": "Agency deleted successfully."})
     except Exception as e:
-        conn.rollback()
+        conn.rollback();
         print(f"ERROR in /admin/agencies/delete: {e}")
         return jsonify({"success": False, "message": "An internal server error occurred."}), 500
     finally:
@@ -128,7 +136,6 @@ def delete_agency(agency_id):
         conn.close()
 
 
-# --- Agency-Specific Admin Routes ---
 @app.route('/admin/agencies/<int:agency_id>/status', methods=['GET'])
 def get_agency_status(agency_id):
     if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
@@ -176,95 +183,112 @@ def set_total_licenses(agency_id):
         conn.close()
 
 
-def bulk_update_device_status(agency_id, device_ids, status):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        query = "UPDATE licenses SET status = %s WHERE agency_id = %s AND device_id = ANY(%s);"
-        cur.execute(query, (status, agency_id, device_ids))
-        conn.commit()
-        return {"success": True, "message": f"{cur.rowcount} device(s) updated to '{status}'."}
-    except Exception as e:
-        conn.rollback();
-        print(f"ERROR during bulk status update: {e}")
-        return {"success": False, "message": "Database error during update."}
-    finally:
-        cur.close();
-        conn.close()
-
-
-@app.route('/admin/agencies/<int:agency_id>/bulk_activate_devices', methods=['POST'])
-def bulk_activate(agency_id):
-    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    result = bulk_update_device_status(agency_id, request.get_json().get('device_ids', []), 'active')
-    return jsonify(result)
-
-
-@app.route('/admin/agencies/<int:agency_id>/bulk_deactivate_devices', methods=['POST'])
-def bulk_deactivate(agency_id):
-    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    result = bulk_update_device_status(agency_id, request.get_json().get('device_ids', []), 'inactive')
-    return jsonify(result)
-
-
-@app.route('/admin/agencies/<int:agency_id>/bulk_delete_devices', methods=['POST'])
-def bulk_delete(agency_id):
-    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        query = "DELETE FROM licenses WHERE agency_id = %s AND device_id = ANY(%s) AND status = 'inactive';"
-        cur.execute(query, (agency_id, request.get_json().get('device_ids', [])))
-        conn.commit()
-        return jsonify({"success": True, "message": f"{cur.rowcount} inactive device record(s) deleted."})
-    except Exception as e:
-        conn.rollback();
-        print(f"ERROR during bulk delete: {e}")
-        return jsonify({"success": False, "message": "Database error during deletion."}), 500
-    finally:
-        cur.close();
-        conn.close()
-
-
-@app.route('/admin/agencies/<int:agency_id>/versions', methods=['GET'])
-def get_versions(agency_id):
-    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+#
+# --- CLIENT APPLICATION API V1 ROUTES ---
+#
+@app.route('/api/v1/license/activate', methods=['POST'])
+def api_activate_license():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(
-            "SELECT version_number, release_date, download_url, is_latest FROM versions WHERE agency_id = %s ORDER BY release_date DESC;",
-            (agency_id,))
-        versions = cur.fetchall() or []
-        return jsonify({"success": True, "versions": versions})
+        agency_id = get_agency_id_from_api_key(cur)
+        if not agency_id:
+            return jsonify({"success": False, "message": "Invalid Agency API Key."}), 403
+
+        cur.execute("SELECT total_licenses FROM settings WHERE agency_id = %s;", (agency_id,))
+        total_licenses = (cur.fetchone() or {}).get('total_licenses', 0)
+        cur.execute("SELECT COUNT(*) FROM licenses WHERE agency_id = %s AND status = 'active';", (agency_id,))
+        activated_count = cur.fetchone()['count']
+
+        data = request.get_json()
+        device_id = data.get('device_id')
+        if not device_id: return jsonify({"success": False, "message": "Device ID is required."}), 400
+
+        cur.execute("SELECT id FROM licenses WHERE agency_id = %s AND device_id = %s AND status = 'active';",
+                    (agency_id, device_id))
+        is_already_active = cur.fetchone() is not None
+
+        if not is_already_active and activated_count >= total_licenses:
+            return jsonify(
+                {"success": False, "message": "All licenses are currently in use. Please contact your manager."}), 429
+
+        cur.execute("""
+            INSERT INTO licenses (agency_id, device_id, username, hostname, location, operating_system)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (agency_id, device_id) DO UPDATE SET
+                status = 'active',
+                username = EXCLUDED.username,
+                hostname = EXCLUDED.hostname,
+                location = EXCLUDED.location,
+                operating_system = EXCLUDED.operating_system,
+                activated_at = NOW();
+        """, (agency_id, device_id, data.get('username'), data.get('hostname'), data.get('location'),
+              data.get('operating_system')))
+
+        conn.commit()
+        return jsonify({"success": True, "message": "License activated successfully!"})
+
     except Exception as e:
-        print(f"ERROR in /admin/agencies/.../versions: {e}")
+        conn.rollback();
+        print(f"ERROR in /api/v1/license/activate: {e}")
         return jsonify({"success": False, "message": "An internal server error occurred."}), 500
     finally:
         cur.close();
         conn.close()
 
 
-@app.route('/admin/agencies/<int:agency_id>/set_latest_version', methods=['POST'])
-def set_latest_version(agency_id):
-    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    data = request.get_json()
-    version_number, download_url = data.get('version_number'), data.get('download_url')
-    if not version_number or not download_url: return jsonify(
-        {"success": False, "message": "Version number and download URL are required."}), 400
+@app.route('/api/v1/license/check', methods=['POST'])
+def api_check_license():
     conn = get_db_connection()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute("UPDATE versions SET is_latest = FALSE WHERE agency_id = %s;", (agency_id,))
-        cur.execute(
-            "INSERT INTO versions (agency_id, version_number, download_url, is_latest) VALUES (%s, %s, %s, TRUE) ON CONFLICT (agency_id, version_number) DO UPDATE SET download_url = EXCLUDED.download_url, is_latest = TRUE, release_date = NOW();",
-            (agency_id, version_number, download_url))
-        conn.commit()
-        return jsonify(
-            {"success": True, "message": f"Version {version_number} is now set as the latest for the agency."})
+        agency_id = get_agency_id_from_api_key(cur)
+        if not agency_id:
+            return jsonify({"success": False, "message": "Invalid Agency API Key."}), 403
+
+        device_id = request.get_json().get('device_id')
+        if not device_id: return jsonify({"success": False, "message": "Device ID is required."}), 400
+
+        cur.execute("SELECT status FROM licenses WHERE agency_id = %s AND device_id = %s;", (agency_id, device_id))
+        license_record = cur.fetchone()
+
+        if license_record and license_record['status'] == 'active':
+            return jsonify({"success": True, "message": "License is active."})
+        elif license_record:
+            return jsonify({"success": False, "message": "This license has been deactivated by an administrator."})
+        else:
+            return jsonify({"success": False, "message": "This device has not been licensed."})
+
     except Exception as e:
         conn.rollback();
-        print(f"ERROR in /admin/agencies/.../set_latest_version: {e}")
+        print(f"ERROR in /api/v1/license/check: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close();
+        conn.close()
+
+
+@app.route('/api/v1/version/latest', methods=['GET'])
+def api_get_latest_version():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        agency_id = get_agency_id_from_api_key(cur)
+        if not agency_id:
+            return jsonify({"success": False, "message": "Invalid Agency API Key."}), 403
+
+        cur.execute("SELECT version_number, download_url FROM versions WHERE agency_id = %s AND is_latest = TRUE;",
+                    (agency_id,))
+        version_record = cur.fetchone()
+
+        if version_record:
+            return jsonify({"success": True, "latest_version": version_record['version_number'],
+                            "download_url": version_record['download_url']})
+        else:
+            return jsonify({"success": True, "latest_version": "99.0.0", "download_url": ""})
+
+    except Exception as e:
+        print(f"ERROR in /api/v1/version/latest: {e}")
         return jsonify({"success": False, "message": "An internal server error occurred."}), 500
     finally:
         cur.close();
