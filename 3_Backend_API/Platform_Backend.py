@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 # --- Configuration ---
 # This will be set via Environment Variables on Render
-SUPER_ADMIN_KEY = os.environ.get("FLASK_SUPER_ADMIN_KEY", "q/9^}H=W:HJ;%}t>$YR$g1[")
+SUPER_ADMIN_KEY = os.environ.get("FLASK_SUPER_ADMIN_KEY", "q/9^}H=W:HJ;%}t>$`YR$g1[")
 
 
 def get_db_connection():
@@ -30,6 +30,7 @@ def setup_database():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            # The CREATE TABLE statements are idempotent, so they are safe to run on every start
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS agencies (
                     id SERIAL PRIMARY KEY,
@@ -85,17 +86,16 @@ with app.app_context():
 
 
 # --- Helper Function ---
-def is_super_admin(request_data):
-    """Checks for the super admin key in the request JSON."""
-    return request_data.get('admin_key') == SUPER_ADMIN_KEY
+def is_super_admin():
+    """Checks for the super admin key in the request headers."""
+    return request.headers.get('X-Admin-Key') == SUPER_ADMIN_KEY
 
 
 # --- Super Admin Routes ---
 @app.route('/admin/agencies', methods=['GET'])
 def get_agencies():
     """Lists all created agencies."""
-    admin_key = request.args.get('admin_key')
-    if admin_key != SUPER_ADMIN_KEY:
+    if not is_super_admin():
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
     conn = get_db_connection()
@@ -115,10 +115,10 @@ def get_agencies():
 @app.route('/admin/create_agency', methods=['POST'])
 def create_agency():
     """Creates a new agency and its default settings."""
-    data = request.get_json()
-    if not is_super_admin(data):
+    if not is_super_admin():
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
+    data = request.get_json()
     agency_name = data.get('agency_name')
     if not agency_name:
         return jsonify({"success": False, "message": "Agency name is required."}), 400
@@ -129,7 +129,6 @@ def create_agency():
     try:
         cur.execute("INSERT INTO agencies (name, api_key) VALUES (%s, %s) RETURNING *;", (agency_name, new_api_key))
         agency = cur.fetchone()
-        # Create default settings for the new agency
         cur.execute("INSERT INTO settings (agency_id, total_licenses) VALUES (%s, %s);", (agency['id'], 25))
         conn.commit()
         return jsonify({"success": True, "message": f"Agency '{agency_name}' created.", "agency": agency}), 201
@@ -150,22 +149,19 @@ def create_agency():
 @app.route('/admin/agencies/<int:agency_id>/status', methods=['GET'])
 def get_agency_status(agency_id):
     """Gets the license status for a specific agency."""
-    if request.args.get('admin_key') != SUPER_ADMIN_KEY:
+    if not is_super_admin():
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        # Get total licenses
         cur.execute("SELECT total_licenses FROM settings WHERE agency_id = %s;", (agency_id,))
         settings = cur.fetchone()
         total_licenses = settings['total_licenses'] if settings else 0
 
-        # Get activated count
         cur.execute("SELECT COUNT(*) FROM licenses WHERE agency_id = %s AND status = 'active';", (agency_id,))
         activated_count = cur.fetchone()['count']
 
-        # Get device list
         cur.execute(
             "SELECT device_id, username, hostname, location, operating_system, status, activated_at FROM licenses WHERE agency_id = %s ORDER BY activated_at DESC;",
             (agency_id,))
@@ -189,10 +185,10 @@ def get_agency_status(agency_id):
 @app.route('/admin/agencies/<int:agency_id>/set_total_licenses', methods=['POST'])
 def set_total_licenses(agency_id):
     """Sets the total number of licenses for an agency."""
-    data = request.get_json()
-    if not is_super_admin(data):
+    if not is_super_admin():
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
+    data = request.get_json()
     new_total = data.get('new_total_licenses')
     if not isinstance(new_total, int) or new_total < 0:
         return jsonify({"success": False, "message": "Invalid number of licenses."}), 400
@@ -200,7 +196,6 @@ def set_total_licenses(agency_id):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Use UPSERT to handle both insert and update cases
         cur.execute("""
             INSERT INTO settings (agency_id, total_licenses) VALUES (%s, %s)
             ON CONFLICT (agency_id) DO UPDATE SET total_licenses = EXCLUDED.total_licenses;
@@ -221,8 +216,6 @@ def bulk_update_device_status(agency_id, device_ids, status):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Use psycopg2's 'extras.execute_values' for efficient bulk updates if needed,
-        # but a simple loop is fine for a few devices.
         query = "UPDATE licenses SET status = %s WHERE agency_id = %s AND device_id = ANY(%s);"
         cur.execute(query, (status, agency_id, device_ids))
         conn.commit()
@@ -238,27 +231,24 @@ def bulk_update_device_status(agency_id, device_ids, status):
 
 @app.route('/admin/agencies/<int:agency_id>/bulk_activate_devices', methods=['POST'])
 def bulk_activate(agency_id):
-    data = request.get_json()
-    if not is_super_admin(data): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    device_ids = data.get('device_ids', [])
+    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    device_ids = request.get_json().get('device_ids', [])
     result = bulk_update_device_status(agency_id, device_ids, 'active')
     return jsonify(result)
 
 
 @app.route('/admin/agencies/<int:agency_id>/bulk_deactivate_devices', methods=['POST'])
 def bulk_deactivate(agency_id):
-    data = request.get_json()
-    if not is_super_admin(data): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    device_ids = data.get('device_ids', [])
+    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    device_ids = request.get_json().get('device_ids', [])
     result = bulk_update_device_status(agency_id, device_ids, 'inactive')
     return jsonify(result)
 
 
 @app.route('/admin/agencies/<int:agency_id>/bulk_delete_devices', methods=['POST'])
 def bulk_delete(agency_id):
-    data = request.get_json()
-    if not is_super_admin(data): return jsonify({"success": False, "message": "Unauthorized"}), 403
-    device_ids = data.get('device_ids', [])
+    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    device_ids = request.get_json().get('device_ids', [])
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -278,7 +268,7 @@ def bulk_delete(agency_id):
 
 @app.route('/admin/agencies/<int:agency_id>/versions', methods=['GET'])
 def get_versions(agency_id):
-    if request.args.get('admin_key') != SUPER_ADMIN_KEY:
+    if not is_super_admin():
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
     conn = get_db_connection()
@@ -299,10 +289,10 @@ def get_versions(agency_id):
 
 @app.route('/admin/agencies/<int:agency_id>/set_latest_version', methods=['POST'])
 def set_latest_version(agency_id):
-    data = request.get_json()
-    if not is_super_admin(data):
+    if not is_super_admin():
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
+    data = request.get_json()
     version_number = data.get('version_number')
     download_url = data.get('download_url')
     if not version_number or not download_url:
@@ -311,10 +301,8 @@ def set_latest_version(agency_id):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # First, set all other versions for this agency to not be the latest
         cur.execute("UPDATE versions SET is_latest = FALSE WHERE agency_id = %s;", (agency_id,))
 
-        # Then, UPSERT the new version
         cur.execute("""
             INSERT INTO versions (agency_id, version_number, download_url, is_latest)
             VALUES (%s, %s, %s, TRUE)
@@ -338,5 +326,4 @@ def set_latest_version(agency_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    # Use 0.0.0.0 to be accessible on the network
     app.run(host='0.0.0.0', port=port, debug=True)
