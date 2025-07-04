@@ -15,14 +15,15 @@ app = Flask(__name__)
 # This will be set via Environment Variables on Render
 SUPER_ADMIN_KEY = os.environ.get("FLASK_SUPER_ADMIN_KEY", "q/9^}H=W:HJ;%}t>$YR$g1[")
 
+
 def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
-    # On Render, this single DATABASE_URL is provided in the environment
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
         raise ValueError("FATAL ERROR: DATABASE_URL environment variable is not set.")
     conn = psycopg2.connect(db_url)
     return conn
+
 
 def setup_database():
     """Initializes the database schema for PostgreSQL."""
@@ -72,19 +73,50 @@ def setup_database():
             ''')
         conn.commit()
         print("Database setup for PostgreSQL support is complete.")
+    except Exception as e:
+        print(f"Error during database setup: {e}")
     finally:
         conn.close()
 
-# This will run automatically when the web app starts on Render
-setup_database()
 
-# --- All API routes are the same and will work correctly ---
-# ... (all the @app.route functions from before) ...
+# Run setup on startup
+with app.app_context():
+    setup_database()
+
+
+# --- Helper Function ---
+def is_super_admin(request_data):
+    """Checks for the super admin key in the request JSON."""
+    return request_data.get('admin_key') == SUPER_ADMIN_KEY
+
+
+# --- Super Admin Routes ---
+@app.route('/admin/agencies', methods=['GET'])
+def get_agencies():
+    """Lists all created agencies."""
+    admin_key = request.args.get('admin_key')
+    if admin_key != SUPER_ADMIN_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute("SELECT id, name, api_key, created_at FROM agencies ORDER BY name;")
+        agencies = cur.fetchall()
+        return jsonify({"success": True, "agencies": agencies})
+    except Exception as e:
+        print(f"ERROR in /admin/agencies: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
 
 @app.route('/admin/create_agency', methods=['POST'])
 def create_agency():
+    """Creates a new agency and its default settings."""
     data = request.get_json()
-    if data.get('super_admin_key') != SUPER_ADMIN_KEY:
+    if not is_super_admin(data):
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
     agency_name = data.get('agency_name')
@@ -97,6 +129,7 @@ def create_agency():
     try:
         cur.execute("INSERT INTO agencies (name, api_key) VALUES (%s, %s) RETURNING *;", (agency_name, new_api_key))
         agency = cur.fetchone()
+        # Create default settings for the new agency
         cur.execute("INSERT INTO settings (agency_id, total_licenses) VALUES (%s, %s);", (agency['id'], 25))
         conn.commit()
         return jsonify({"success": True, "message": f"Agency '{agency_name}' created.", "agency": agency}), 201
@@ -111,8 +144,199 @@ def create_agency():
         cur.close()
         conn.close()
 
-# ... include all other @app.route functions here ...
+
+# --- Agency-Specific Admin Routes ---
+
+@app.route('/admin/agencies/<int:agency_id>/status', methods=['GET'])
+def get_agency_status(agency_id):
+    """Gets the license status for a specific agency."""
+    if request.args.get('admin_key') != SUPER_ADMIN_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        # Get total licenses
+        cur.execute("SELECT total_licenses FROM settings WHERE agency_id = %s;", (agency_id,))
+        settings = cur.fetchone()
+        total_licenses = settings['total_licenses'] if settings else 0
+
+        # Get activated count
+        cur.execute("SELECT COUNT(*) FROM licenses WHERE agency_id = %s AND status = 'active';", (agency_id,))
+        activated_count = cur.fetchone()['count']
+
+        # Get device list
+        cur.execute(
+            "SELECT device_id, username, hostname, location, operating_system, status, activated_at FROM licenses WHERE agency_id = %s ORDER BY activated_at DESC;",
+            (agency_id,))
+        devices = cur.fetchall()
+
+        return jsonify({
+            "success": True,
+            "total_licenses": total_licenses,
+            "activated_count": activated_count,
+            "licenses_remaining": total_licenses - activated_count,
+            "activated_devices": devices
+        })
+    except Exception as e:
+        print(f"ERROR in /admin/agencies/.../status: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/admin/agencies/<int:agency_id>/set_total_licenses', methods=['POST'])
+def set_total_licenses(agency_id):
+    """Sets the total number of licenses for an agency."""
+    data = request.get_json()
+    if not is_super_admin(data):
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    new_total = data.get('new_total_licenses')
+    if not isinstance(new_total, int) or new_total < 0:
+        return jsonify({"success": False, "message": "Invalid number of licenses."}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Use UPSERT to handle both insert and update cases
+        cur.execute("""
+            INSERT INTO settings (agency_id, total_licenses) VALUES (%s, %s)
+            ON CONFLICT (agency_id) DO UPDATE SET total_licenses = EXCLUDED.total_licenses;
+        """, (agency_id, new_total))
+        conn.commit()
+        return jsonify({"success": True, "message": f"Total licenses for agency set to {new_total}."})
+    except Exception as e:
+        conn.rollback()
+        print(f"ERROR in /admin/agencies/.../set_total_licenses: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+def bulk_update_device_status(agency_id, device_ids, status):
+    """Helper to activate or deactivate devices."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Use psycopg2's 'extras.execute_values' for efficient bulk updates if needed,
+        # but a simple loop is fine for a few devices.
+        query = "UPDATE licenses SET status = %s WHERE agency_id = %s AND device_id = ANY(%s);"
+        cur.execute(query, (status, agency_id, device_ids))
+        conn.commit()
+        return {"success": True, "message": f"{cur.rowcount} device(s) updated to '{status}'."}
+    except Exception as e:
+        conn.rollback()
+        print(f"ERROR during bulk status update: {e}")
+        return {"success": False, "message": "Database error during update."}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/admin/agencies/<int:agency_id>/bulk_activate_devices', methods=['POST'])
+def bulk_activate(agency_id):
+    data = request.get_json()
+    if not is_super_admin(data): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    device_ids = data.get('device_ids', [])
+    result = bulk_update_device_status(agency_id, device_ids, 'active')
+    return jsonify(result)
+
+
+@app.route('/admin/agencies/<int:agency_id>/bulk_deactivate_devices', methods=['POST'])
+def bulk_deactivate(agency_id):
+    data = request.get_json()
+    if not is_super_admin(data): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    device_ids = data.get('device_ids', [])
+    result = bulk_update_device_status(agency_id, device_ids, 'inactive')
+    return jsonify(result)
+
+
+@app.route('/admin/agencies/<int:agency_id>/bulk_delete_devices', methods=['POST'])
+def bulk_delete(agency_id):
+    data = request.get_json()
+    if not is_super_admin(data): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    device_ids = data.get('device_ids', [])
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        query = "DELETE FROM licenses WHERE agency_id = %s AND device_id = ANY(%s) AND status = 'inactive';"
+        cur.execute(query, (agency_id, device_ids))
+        conn.commit()
+        return jsonify({"success": True, "message": f"{cur.rowcount} inactive device record(s) deleted."})
+    except Exception as e:
+        conn.rollback()
+        print(f"ERROR during bulk delete: {e}")
+        return jsonify({"success": False, "message": "Database error during deletion."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/admin/agencies/<int:agency_id>/versions', methods=['GET'])
+def get_versions(agency_id):
+    if request.args.get('admin_key') != SUPER_ADMIN_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT version_number, release_date, download_url, is_latest FROM versions WHERE agency_id = %s ORDER BY release_date DESC;",
+            (agency_id,))
+        versions = cur.fetchall()
+        return jsonify({"success": True, "versions": versions})
+    except Exception as e:
+        print(f"ERROR in /admin/agencies/.../versions: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/admin/agencies/<int:agency_id>/set_latest_version', methods=['POST'])
+def set_latest_version(agency_id):
+    data = request.get_json()
+    if not is_super_admin(data):
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    version_number = data.get('version_number')
+    download_url = data.get('download_url')
+    if not version_number or not download_url:
+        return jsonify({"success": False, "message": "Version number and download URL are required."}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # First, set all other versions for this agency to not be the latest
+        cur.execute("UPDATE versions SET is_latest = FALSE WHERE agency_id = %s;", (agency_id,))
+
+        # Then, UPSERT the new version
+        cur.execute("""
+            INSERT INTO versions (agency_id, version_number, download_url, is_latest)
+            VALUES (%s, %s, %s, TRUE)
+            ON CONFLICT (agency_id, version_number) DO UPDATE
+            SET download_url = EXCLUDED.download_url,
+                is_latest = TRUE,
+                release_date = NOW();
+        """, (agency_id, version_number, download_url))
+
+        conn.commit()
+        return jsonify(
+            {"success": True, "message": f"Version {version_number} is now set as the latest for the agency."})
+    except Exception as e:
+        conn.rollback()
+        print(f"ERROR in /admin/agencies/.../set_latest_version: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    app.run(host='0.0.0.0', port=port)
+    # Use 0.0.0.0 to be accessible on the network
+    app.run(host='0.0.0.0', port=port, debug=True)
