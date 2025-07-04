@@ -183,6 +183,51 @@ def set_total_licenses(agency_id):
         conn.close()
 
 
+@app.route('/admin/agencies/<int:agency_id>/versions', methods=['GET'])
+def get_versions(agency_id):
+    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT version_number, release_date, download_url, is_latest FROM versions WHERE agency_id = %s ORDER BY release_date DESC;",
+            (agency_id,))
+        versions = cur.fetchall() or []
+        return jsonify({"success": True, "versions": versions})
+    except Exception as e:
+        print(f"ERROR in /admin/agencies/.../versions: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close();
+        conn.close()
+
+
+@app.route('/admin/agencies/<int:agency_id>/set_latest_version', methods=['POST'])
+def set_latest_version(agency_id):
+    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    data = request.get_json()
+    version_number, download_url = data.get('version_number'), data.get('download_url')
+    if not version_number or not download_url: return jsonify(
+        {"success": False, "message": "Version number and download URL are required."}), 400
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE versions SET is_latest = FALSE WHERE agency_id = %s;", (agency_id,))
+        cur.execute(
+            "INSERT INTO versions (agency_id, version_number, download_url, is_latest) VALUES (%s, %s, %s, TRUE) ON CONFLICT (agency_id, version_number) DO UPDATE SET download_url = EXCLUDED.download_url, is_latest = TRUE, release_date = NOW();",
+            (agency_id, version_number, download_url))
+        conn.commit()
+        return jsonify(
+            {"success": True, "message": f"Version {version_number} is now set as the latest for the agency."})
+    except Exception as e:
+        conn.rollback();
+        print(f"ERROR in /admin/agencies/.../set_latest_version: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close();
+        conn.close()
+
+
 #
 # --- CLIENT APPLICATION API V1 ROUTES ---
 #
