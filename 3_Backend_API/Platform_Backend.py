@@ -24,7 +24,6 @@ def get_db_connection():
 
 def setup_database():
     """Initializes the database schema for PostgreSQL."""
-    # This function is safe to run multiple times.
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -60,7 +59,11 @@ def get_agencies():
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("SELECT id, name, api_key, created_at FROM agencies ORDER BY name;")
+        # BUG FIX: It's possible for fetchall() to return None or an empty list.
+        # Handle this gracefully.
         agencies = cur.fetchall()
+        if agencies is None:
+            agencies = []
         return jsonify({"success": True, "agencies": agencies})
     except Exception as e:
         print(f"ERROR in /admin/agencies: {e}")
@@ -103,7 +106,7 @@ def get_agency_status(agency_id):
         cur.execute("SELECT COUNT(*) FROM licenses WHERE agency_id = %s AND status = 'active';", (agency_id,))
         activated_count = cur.fetchone()['count']
         cur.execute("SELECT device_id, username, hostname, location, operating_system, status, activated_at FROM licenses WHERE agency_id = %s ORDER BY activated_at DESC;", (agency_id,))
-        devices = cur.fetchall()
+        devices = cur.fetchall() or []
         return jsonify({"success": True, "total_licenses": total_licenses, "activated_count": activated_count, "licenses_remaining": total_licenses - activated_count, "activated_devices": devices})
     except Exception as e:
         print(f"ERROR in /admin/agencies/.../status: {e}")
@@ -177,7 +180,7 @@ def get_versions(agency_id):
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("SELECT version_number, release_date, download_url, is_latest FROM versions WHERE agency_id = %s ORDER BY release_date DESC;", (agency_id,))
-        versions = cur.fetchall()
+        versions = cur.fetchall() or []
         return jsonify({"success": True, "versions": versions})
     except Exception as e:
         print(f"ERROR in /admin/agencies/.../versions: {e}")
