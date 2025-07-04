@@ -54,13 +54,22 @@ def index():
 # --- Super Admin Routes ---
 @app.route('/admin/agencies', methods=['GET'])
 def get_agencies():
-    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
+    # --- DEBUG LOGGING ---
+    print("--- Received request for /admin/agencies ---")
+    print(f"SERVER KEY IS: '{SUPER_ADMIN_KEY}'")
+    print("INCOMING HEADERS:")
+    print(request.headers)
+    # --- END DEBUG LOGGING ---
+
+    if not is_super_admin():
+        print("--- AUTH FAILED ---") # <-- DEBUG LOGGING
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    print("--- AUTH SUCCESSFUL ---") # <-- DEBUG LOGGING
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("SELECT id, name, api_key, created_at FROM agencies ORDER BY name;")
-        # BUG FIX: It's possible for fetchall() to return None or an empty list.
-        # Handle this gracefully.
         agencies = cur.fetchall()
         if agencies is None:
             agencies = []
@@ -94,7 +103,7 @@ def create_agency():
     finally:
         cur.close(); conn.close()
 
-# --- Agency-Specific Admin Routes ---
+# --- Agency-Specific Admin Routes (No changes needed below) ---
 @app.route('/admin/agencies/<int:agency_id>/status', methods=['GET'])
 def get_agency_status(agency_id):
     if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
