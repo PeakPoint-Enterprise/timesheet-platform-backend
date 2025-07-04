@@ -12,7 +12,8 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- Configuration ---
-SUPER_ADMIN_KEY = os.environ.get("FLASK_SUPER_ADMIN_KEY", "q/9^}H=W:HJ;%}t>$`YR$g1[")
+# --- NEW, SAFE KEY HERE ---
+SUPER_ADMIN_KEY = os.environ.get("FLASK_SUPER_ADMIN_KEY", "f47ac10b-58cc-4372-a567-0e02b2c3d479")
 
 def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
@@ -54,25 +55,12 @@ def index():
 # --- Super Admin Routes ---
 @app.route('/admin/agencies', methods=['GET'])
 def get_agencies():
-    # --- DEBUG LOGGING ---
-    print("--- Received request for /admin/agencies ---")
-    print(f"SERVER KEY IS: '{SUPER_ADMIN_KEY}'")
-    print("INCOMING HEADERS:")
-    print(request.headers)
-    # --- END DEBUG LOGGING ---
-
-    if not is_super_admin():
-        print("--- AUTH FAILED ---") # <-- DEBUG LOGGING
-        return jsonify({"success": False, "message": "Unauthorized"}), 403
-
-    print("--- AUTH SUCCESSFUL ---") # <-- DEBUG LOGGING
+    if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("SELECT id, name, api_key, created_at FROM agencies ORDER BY name;")
-        agencies = cur.fetchall()
-        if agencies is None:
-            agencies = []
+        agencies = cur.fetchall() or []
         return jsonify({"success": True, "agencies": agencies})
     except Exception as e:
         print(f"ERROR in /admin/agencies: {e}")
@@ -103,7 +91,7 @@ def create_agency():
     finally:
         cur.close(); conn.close()
 
-# --- Agency-Specific Admin Routes (No changes needed below) ---
+# --- Agency-Specific Admin Routes ---
 @app.route('/admin/agencies/<int:agency_id>/status', methods=['GET'])
 def get_agency_status(agency_id):
     if not is_super_admin(): return jsonify({"success": False, "message": "Unauthorized"}), 403
